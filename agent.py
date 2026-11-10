@@ -8,6 +8,9 @@ import os
 from typing import TypedDict, Sequence, Annotated
 from langgraph.graph.message import add_messages
 import subprocess
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
+
 from utils import save_png, log_err, log_info
 
 load_dotenv()
@@ -29,6 +32,7 @@ guard_llm = ChatGroq(
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     project_name: str
+    last_action: str
 
 @tool
 def create_plan(content: str, project_name: str) -> bool:
@@ -215,6 +219,10 @@ def decision(state: AgentState) -> str:
 
 def inspect_prompt(state: AgentState) -> str:
     last_message = state["messages"][-1]
+    if isinstance(last_message, AIMessage) or not last_message.content.strip():
+        log_info("Skipping prompt inspection...") #WARNING
+        return "llm_invoke"
+
     response = guard_llm.invoke([
         dict(role = "user", content = last_message.content)
     ])
@@ -226,11 +234,54 @@ def inspect_prompt(state: AgentState) -> str:
         log_info("Prompt inspection passed")
         return "llm_invoke"
 
+def human_approval(state: AgentState) -> AgentState: #node
+    """Implementing human in the loop (HITL)
+
+    Args:
+        state (AgentState): agent's state
+
+    Returns:
+        AgentState: agent's state
+    """
+    last_message = state["messages"][-1]
+    tool_calls = getattr(last_message, "tool_calls", [])
+
+    log_info("--- Entering human_approval node ---")
+
+    user_decision = interrupt(dict(
+        user_question = "Tool call requested by agent:",
+        tool_calls  = tool_calls
+    ))
+    log_info(f"User decision: {user_decision}")
+
+    # if isinstance(user_decision, dict) and user_decision.get("action")  == "approve":
+    if user_decision.strip() == "approve":
+        log_info(f"tool call approved by user")
+        return dict(last_action = "approve")
+    else:
+        log_info(f"tool call rejected by user")
+
+        return dict(last_action = "reject", messages = [
+            AIMessage(content = "tool call rejected by user")
+        ])
+
+def human_approval_decision(state: AgentState) -> str:
+    """Decide whether to call the tool post approval
+
+    Args:
+        state (AgentState): agent's state
+
+    Returns:
+        str: node name
+    """
+    return "tool_node" if state["last_action"] == "approve" else "llm_invoke"
+
 graph = StateGraph(AgentState)
 
 graph.add_node("llm_invoke", llm_invoke)
 graph.add_node("tool_node", ToolNode(tools = tools))
 graph.add_node("router", lambda state: state)
+graph.add_node("human_approval", human_approval)
 
 # graph.set_entry_point("llm_invoke")
 graph.set_entry_point("router")
@@ -243,12 +294,19 @@ graph.add_conditional_edges("router",
 graph.add_conditional_edges("llm_invoke",
                             decision,
                             {
-                                "tool_node":"tool_node",
+                                "tool_node":"human_approval",
                                 END: END
                             })
-graph.add_edge("tool_node","llm_invoke")
+graph.add_conditional_edges("human_approval",
+                            human_approval_decision,
+                            {
+                                "tool_node": "tool_node",
+                                "llm_invoke": "llm_invoke"
+                            })
+graph.add_edge("tool_node","router")
 
-agent = graph.compile()
+memory = MemorySaver()
+agent = graph.compile(checkpointer = memory)
 
 
-# save_png(agent.get_graph().draw_mermaid_png(),img_name = "graph-2.png")
+# save_png(agent.get_graph().draw_mermaid_png(),img_name = "graph-3.png")
