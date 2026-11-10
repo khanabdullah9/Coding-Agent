@@ -14,10 +14,15 @@ load_dotenv()
 
 DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop")
 
-models = ["openai/gpt-oss-120b","qwen/qwen3.8-27b"]
+models = ["openai/gpt-oss-120b","qwen/qwen3.8-27b","meta-llama/llama-prompt-guard-2-22m"]
 
 llm = ChatGroq(
     model = models[0],
+    api_key = os.getenv("OLLAMA_API_KEY")
+)
+
+guard_llm = ChatGroq(
+    model = models[2],
     api_key = os.getenv("OLLAMA_API_KEY")
 )
 
@@ -208,12 +213,33 @@ def decision(state: AgentState) -> str:
 
     return "tool_node" if last_message.tool_calls else END
 
+def inspect_prompt(state: AgentState) -> str:
+    last_message = state["messages"][-1]
+    response = guard_llm.invoke([
+        dict(role = "user", content = last_message.content)
+    ])
+
+    if float(response.content) > 0.7:
+        log_info(f"Malicious prompt detected (probability: {response.content})")
+        return END
+    else:
+        log_info("Prompt inspection passed")
+        return "llm_invoke"
+
 graph = StateGraph(AgentState)
 
 graph.add_node("llm_invoke", llm_invoke)
 graph.add_node("tool_node", ToolNode(tools = tools))
+graph.add_node("router", lambda state: state)
 
-graph.set_entry_point("llm_invoke")
+# graph.set_entry_point("llm_invoke")
+graph.set_entry_point("router")
+graph.add_conditional_edges("router",
+                            inspect_prompt,
+                            {
+                                END: END,
+                                "llm_invoke": "llm_invoke"
+                            })
 graph.add_conditional_edges("llm_invoke",
                             decision,
                             {
@@ -221,9 +247,8 @@ graph.add_conditional_edges("llm_invoke",
                                 END: END
                             })
 graph.add_edge("tool_node","llm_invoke")
-# graph.set_finish_point("llm_invoke")
 
 agent = graph.compile()
 
 
-# save_png(agent.get_graph().draw_mermaid_png(),img_name = "graph-1.png")
+# save_png(agent.get_graph().draw_mermaid_png(),img_name = "graph-2.png")
